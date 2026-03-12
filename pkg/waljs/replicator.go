@@ -98,13 +98,24 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, ty
 	logger.Infof("SystemID:%s Timeline:%d XLogPos:%s Database:%s",
 		sysident.SystemID, sysident.Timeline, sysident.XLogPos, sysident.DBName)
 
+	// Use IdentifySystem XLogPos as the WAL target. The slot query's
+	// pg_current_wal_lsn() runs over the regular SQL connection which can
+	// return stale values in certain environments (e.g. proxied or pooled
+	// connections), while IdentifySystem always reflects the primary's
+	// actual WAL position via the replication protocol.
+	walTarget := sysident.XLogPos
+	if walTarget < slot.LSN {
+		logger.Warnf("IdentifySystem XLogPos [%s] < confirmed_flush_lsn [%s]; using confirmed_flush_lsn as target", walTarget, slot.LSN)
+		walTarget = slot.LSN
+	}
+
 	// Create and return final connection object
 	socket := &Socket{
 		pgConn:             pgConn,
 		changeFilter:       NewChangeFilter(typeConverter, config.Tables.Array()...),
 		ConfirmedFlushLSN:  slot.LSN,
 		ClientXLogPos:      slot.LSN,
-		CurrentWalPosition: slot.CurrentLSN,
+		CurrentWalPosition: walTarget,
 		ReplicationSlot:    config.ReplicationSlotName,
 		initialWaitTime:    config.InitialWaitTime,
 	}
