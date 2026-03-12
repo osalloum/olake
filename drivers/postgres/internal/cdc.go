@@ -119,23 +119,34 @@ func validateReplicationSlot(ctx context.Context, conn *sqlx.DB, slotName string
 }
 
 func validateGlobalState(globalState *types.GlobalState, confirmedFlushLSN pglogrepl.LSN) error {
-	// global state exist check for cursor and cursor mismatch
 	var postgresGlobalState waljs.WALState
 	if err := utils.Unmarshal(globalState.State, &postgresGlobalState); err != nil {
 		return fmt.Errorf("failed to unmarshal global state: %s", err)
 	}
 	if postgresGlobalState.LSN == "" {
 		return fmt.Errorf("%w: lsn is empty, please proceed with clear destination", constants.ErrNonRetryable)
-	} else {
-		parsed, err := pglogrepl.ParseLSN(postgresGlobalState.LSN)
-		if err != nil {
-			return fmt.Errorf("failed to parse stored lsn[%s]: %s", postgresGlobalState.LSN, err)
-		}
-		// failing sync when lsn mismatch found (from state and confirmed flush lsn), as otherwise on backfill, duplication of data will occur
-		// suggesting to proceed with clear destination
-		if parsed != confirmedFlushLSN {
-			return fmt.Errorf("%w: lsn mismatch, please proceed with clear destination. lsn saved in state [%s] current lsn [%s]", constants.ErrNonRetryable, parsed, confirmedFlushLSN)
-		}
 	}
-	return nil
+
+	parsed, err := pglogrepl.ParseLSN(postgresGlobalState.LSN)
+	if err != nil {
+		return fmt.Errorf("failed to parse stored lsn[%s]: %s", postgresGlobalState.LSN, err)
+	}
+
+	if parsed == confirmedFlushLSN {
+		return nil
+	}
+
+	// If the slot has advanced past the state, this is a known consequence of
+	// AcknowledgeLSN succeeding (slot advances) while PostCDC fails to persist
+	// the new state.  The WAL between state and slot has already been consumed
+	// and cannot be replayed, so the only viable path forward is to accept the
+	// slot position and continue.
+	if confirmedFlushLSN > parsed {
+		logger.Warnf("slot LSN [%s] is ahead of state LSN [%s]; auto-advancing state to match slot", confirmedFlushLSN, parsed)
+		globalState.State = waljs.WALState{LSN: confirmedFlushLSN.String()}
+		return nil
+	}
+
+	// State is ahead of slot — this shouldn't happen and indicates corruption
+	return fmt.Errorf("%w: lsn mismatch, state [%s] is ahead of slot [%s], please proceed with clear destination", constants.ErrNonRetryable, parsed, confirmedFlushLSN)
 }

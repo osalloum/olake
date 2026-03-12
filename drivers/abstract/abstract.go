@@ -242,7 +242,16 @@ func generateThreadID(streamID string, suffix string) string {
 // The threadID and closeMessage parameters are optional (empty string means not used) and only apply to single writer cases
 func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *error, writer any, threadID string, postProcess func(ctx context.Context) error) func() {
 	return func() {
-		// Cancel context if there's an error, so other threads using this context can detect the failure
+		// Run PostCDC BEFORE canceling the context so it can acknowledge the
+		// final LSN and persist state.  Canceling first would make PostCDC
+		// always receive a dead context and fail with "context canceled",
+		// masking the original error.
+		postErr := postProcess(ctx)
+		if postErr != nil {
+			*err = utils.Ternary(*err == nil, postErr, fmt.Errorf("%s: prev error: %w", postErr, *err)).(error)
+		}
+
+		// Cancel context after post-processing so other threads detect the failure
 		if *err != nil {
 			cancel()
 		}
@@ -274,16 +283,6 @@ func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *er
 		// check for panics before post-processing
 		if r := recover(); r != nil {
 			*err = utils.Ternary(*err == nil, fmt.Errorf("panic recovered: %v", r), fmt.Errorf("%s: prev error: %w", r, *err)).(error)
-		}
-
-		// cancel context if error occurred after closing writers
-		if *err != nil {
-			cancel()
-		}
-
-		postErr := postProcess(ctx)
-		if postErr != nil {
-			*err = utils.Ternary(*err == nil, postErr, fmt.Errorf("%s: prev error: %w", postErr, *err)).(error)
 		}
 
 		if *err != nil && threadID != "" {
